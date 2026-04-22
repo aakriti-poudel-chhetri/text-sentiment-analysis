@@ -1,0 +1,456 @@
+---
+title: "EDS 231: Assignment 1"
+author: "Aakriti Poudel"
+date: "April 12, 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+## Load all necessary libraries
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(jsonlite)  # send API requests and parse JSON responses
+library(tidyverse) # data wrangling and visualization
+library(tidytext)  # text tokenization and stop word tools
+library(ggplot2)   # plotting
+```
+
+## Assign the API key
+
+The API key is stored as an environment variable so it does not appear in the knitted output. It can be set by running `usethis::edit_r_environ()`, adding `NYT_KEY = api_key`, and then restarting R.
+
+```{r api-key, include=FALSE}
+API_KEY <- Sys.getenv("NYT_KEY")
+```
+
+In this assignment, I pulled article data from the New York Times API, did some basic string manipulation, worked with the tidytext format, and built plots to examine how an environmental topic has been covered over time.
+
+---
+
+## Selecting an environmental term
+
+I selected **pollution** as my search term. It is a broad environmental issue that includes air quality, water contamination, soil toxicity and public health, which means the New York Times covers it from many different angles and fairly consistently over time.
+
+Coverage of pollution is also not uniform. It tends to spike around specific events like new EPA regulations, industrial accidents, or studies linking environmental exposure to health outcomes. That variation makes the publication frequency more interesting to analyze than a topic with flat, steady coverage.
+
+I set the query window from January 2016 through December 2025. This ten-year span captures multiple regulatory cycles, election transitions, and several high-profile pollution events, giving the corpus enough depth for a meaningful text analysis.
+
+I used `fromJSON()` from the `{jsonlite}` package to send a request to the NYT API and load the results into R. Setting `flatten = TRUE` converts the nested JSON into a flat data frame that is easier to work with downstream.
+
+```{r api-initial, eval=FALSE}
+# encode the search term and build the API request URL
+searchQ <- URLencode("pollution")
+url <- paste0('https://api.nytimes.com/svc/search/v2/articlesearch.json?q=', searchQ,
+              '&begin_date=20160101&end_date=20251231&api-key=', API_KEY)
+
+# send the initial request and parse the JSON response into R
+pollution_init <- fromJSON(url, flatten = TRUE)
+```
+
+### Inspect the initial query results
+
+Before pulling the full dataset, I checked what the API returned from the first call, the object type, its dimensions, the variable names, and the total number of matching articles.
+
+```{r api-check, eval=FALSE}
+# check what kind of object came back
+class(pollution_init)
+
+# convert to a flat data frame
+pollution_init <- data.frame(pollution_init)
+
+# how many rows and columns
+dim(pollution_init)
+
+# what columns are available
+names(pollution_init)
+
+# total number of articles matching the query
+hits <- pollution_init$response$meta$hits
+print(hits)
+```
+
+The `snippet` column contains a short excerpt from each article. Before running any analysis, I tried out a few `stringr` functions on an example sentence to get comfortable with how these tools work on news text.
+
+```{r basic_stringr, eval=FALSE}
+x <- "Rising levels of air and water pollution are pushing regulators to impose stricter limits on industrial emissions as communities near factories report worsening health outcomes."
+
+tolower(x) # convert to lowercase
+str_split(x, 'p') # split string on letter p
+str_replace(x, 'stricter', 'tougher') # replace first match only
+str_replace_all(x, ' ', '_') # replace all spaces with underscore
+str_detect(x, 'pollution'); str_detect(x, 'emissions') # check if pattern exists in string
+str_locate(x, 'pollution'); str_locate_all(x, 'pollution') # find position of pattern in string
+```
+
+---
+
+## API function
+
+A single API call only returns 10 results. To collect enough articles for a meaningful analysis, I used a function that loops through multiple pages of results and combines them into one data frame. The `Sys.sleep(20)` pause between requests is important, the NYT API enforces a rate limit and will block the connection if requests come in too fast.
+
+```{r api-function}
+nytAPI <- function(term1, begin_date, end_date, api) {
+
+  # encode the search term and build the full request URL
+  searchQ <- URLencode(term1)
+  url <- paste0('https://api.nytimes.com/svc/search/v2/articlesearch.json?q=', searchQ,
+                '&begin_date=', begin_date, '&end_date=', end_date, '&api-key=', api)
+
+  # get total article count from the first call
+  initialsearch <- fromJSON(url, flatten = TRUE)
+  hits <- initialsearch$response$meta$hits
+
+  # return empty data frame if no results found
+  if (hits == 0) return(data.frame())
+
+  # calculate how many pages to loop through (capped at 10 pages = 100 articles max)
+  maxPages <- min(round(hits / 10) - 1, 10)
+
+  # initialize empty data frame to collect results across pages
+  df <- data.frame(id = as.numeric(), created_time = character(),
+                   snippet = character(), headline = character())
+
+  for (i in 0:maxPages) {
+    # fetch one page at a time and extract the relevant columns
+    nytSearch <- fromJSON(paste0(url, "&page=", i), flatten = TRUE)
+    temp <- data.frame(
+      id = 1:nrow(nytSearch$response$docs),
+      created_time = nytSearch$response$docs$pub_date,
+      snippet = nytSearch$response$docs$snippet,
+      headline = nytSearch$response$docs$headline.main
+    )
+    df <- rbind(df, temp)
+    Sys.sleep(20)  # wait between requests to respect the API rate limit
+  }
+  return(df)
+}
+```
+
+I ran the function for "pollution" over the full ten-year date range and saved the output to a CSV. This way I can load the data directly without re-querying the API every time I knit.
+
+```{r results, eval=FALSE}
+term1 <- "pollution"
+results <- nytAPI(term1 = term1,
+                  begin_date = "20160101",
+                  end_date = "20251231",
+                  api = API_KEY)
+
+# save to CSV so the API does not need to be called again when knitting
+write.csv(results, "NYT-pollution.csv", row.names = FALSE)
+nytData <- results
+```
+
+## Load the saved data
+
+The results were already collected and saved as a CSV file. I load it here to avoid re-querying the API on every knit.
+
+**A note on date coverage:** Even though I queried from 2016 to 2025, the data may appear concentrated in recent years. This happens because the NYT API returns a maximum of 100 articles per query (10 pages of 10 results each), and it returns the most recent articles first. So if "pollution" has thousands of matching articles across 10 years, you only get the 100 most recent ones, which all fall in 2025. To get better coverage across all 10 years, the query would need to be split by year and run separately for each one.
+
+```{r load-data}
+# load the saved CSV and preview the structure
+nytData <- read_csv("NYT-pollution.csv")
+dim(nytData)
+head(nytData)
+```
+
+---
+
+## Snippet analysis: Publications per day and word frequency
+
+The NYT API does not provide full article text. Instead, each article comes with a `snippet`, which is a short excerpt, usually the opening sentence or two. I used snippets for the first round of analysis.
+
+### Publications per day (snippets)
+
+This plot shows how many pollution related articles were published on each day in the dataset. I filtered to days with at least 2 articles to keep the chart readable.
+
+```{r date-plot-snippet, fig.width=10, fig.height=7}
+# aggregate article counts by publication day and filter to busy days
+snippet_day <- nytData %>%
+  mutate(pubDay = as.Date(created_time)) %>%
+  group_by(pubDay) %>%
+  summarise(count = n()) %>%
+  filter(count >= 2) %>%
+  arrange(pubDay) %>%
+  mutate(pubDay = factor(pubDay, levels = pubDay))
+
+# plot daily article counts as a vertical bar chart
+ggplot(snippet_day, aes(x = pubDay, y = count)) +
+  geom_col(fill = "#76bfe2") +
+  geom_text(aes(label = count), vjust = -0.5, size = 4) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    x = NULL,
+    y = "Number of articles",
+    title = "How often did the NYT cover pollution? (2016-2025)",
+    subtitle = "Each bar represents a day with 2 or more published articles mentioning pollution",
+    caption = "Data source: New York Times Article Search API"
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 14),
+    plot.caption = element_text(hjust = 1, color = "black", size = 12,
+                                   face = "italic", margin = margin(t = 10)),
+    axis.title.y = element_text(size = 12),
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 12)
+  )
+```
+
+### Tokenization
+
+I used `unnest_tokens()` from `tidytext` to split each snippet into individual words. The function lowercases everything and removes punctuation automatically, putting the data into a tidy one-token-per-row format.
+
+```{r tokenize}
+# split each snippet into one word per row
+tokenized <- nytData %>%
+  unnest_tokens(word, snippet)
+
+head(tokenized[, "word"], 20)
+```
+
+### Word frequency before stop word removal
+
+At this stage the most frequent words are all function words like "the", "a", and "of". These carry no topical meaning, so this plot mostly confirms that cleaning is needed before drawing any conclusions.
+
+```{r raw-freq, fig.width=10, fig.height=7}
+# count raw word frequencies before any cleaning
+tokenized %>%
+  count(word, sort = TRUE) %>%
+  filter(n > 15) %>%
+  mutate(word = reorder(word, n)) %>%
+
+# plot raw word frequencies as a lollipop chart
+  ggplot(aes(x = word, y = n)) +
+  geom_segment(aes(xend = word, y = 0, yend = n),
+               color = "#60380b", linewidth = 0.8) +
+  geom_point(color = "#60380b", size = 2) +
+  geom_text(aes(label = n), hjust = -0.8, size = 4, color = "#60380b") +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    x = NULL,
+    y = "Number of occurrences",
+    title = "Most frequent words in pollution snippets (raw)",
+    caption = "Data source: New York Times Article Search API"
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 14),
+    plot.caption = element_text(hjust = 1, color = "black", size = 12,
+                                   face = "italic", margin = margin(t = 10)),
+    axis.title.x = element_text(size = 12),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12)
+  )
+```
+
+### Stop word removal
+
+I used `anti_join()` with the `stop_words` lexicon from `tidytext` to remove common English function words. After this step the meaningful content words start to surface.
+
+```{r stop-words, fig.width=10, fig.height=7}
+# load the built-in stop word list and remove matching tokens
+data(stop_words)
+tokenized <- tokenized %>%
+  anti_join(stop_words, by = "word")
+
+# plot word frequencies after stop word removal
+tokenized %>%
+  count(word, sort = TRUE) %>%
+  filter(n > 5) %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(x = word, y = n)) +
+  geom_col(fill = "tan4") +
+  geom_text(aes(label = n), hjust = -0.3, size = 4) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    x = NULL,
+    y = "Number of occurrences",
+    title = "Most frequent words after removing stop words",
+    caption = "Data source: New York Times Article Search API"
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 14),
+    plot.caption = element_text(hjust = 1, color = "black", size = 12,
+                                   face = "italic", margin = margin(t = 10)),
+    axis.title.x = element_text(size = 12),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12)
+  )
+```
+
+### Text normalization and cleaning
+
+There is still some noise remaining even after stop word removal. I applied three more transformations to the corpus:
+
+1. **Remove numbers:** figures like "2023" or "10" do not carry topical meaning and clutter the frequency counts.
+2. **Simplify possessives:** "water's" and "water" refer to the same concept and should be counted together.
+3. **Remove context-specific stop words:** generic news language like "said", "mr", and "percent" appears in almost every NYT article but adds nothing to a pollution-focused analysis.
+
+```{r cleaning, fig.width=10, fig.height=7}
+# remove all digits from tokens
+clean_tokens <- str_remove_all(tokenized$word, "[:digit:]")
+
+# strip possessives, handling both straight and curly apostrophes
+clean_tokens <- gsub("'s", "", clean_tokens)
+clean_tokens <- gsub("\u2019s", "", clean_tokens)
+
+# store cleaned tokens back in the data frame
+tokenized$clean <- clean_tokens
+
+# define words that are common in news text but irrelevant to the pollution topic
+custom_stops <- c("said", "also", "mr", "ms", "like", "just", "one", "two",
+                  "percent", "year", "years", "week", "monday", "tuesday",
+                  "wednesday", "thursday", "friday", "new", "says")
+
+# remove empty strings left by cleaning and filter out custom stop words
+tokenized <- tokenized %>%
+  filter(clean != "") %>%
+  filter(!clean %in% custom_stops)
+
+# plot cleaned word frequencies as a lollipop chart
+tokenized %>%
+  count(clean, sort = TRUE) %>%
+  filter(n > 5) %>%
+  mutate(clean = reorder(clean, n)) %>%
+  ggplot(aes(x = clean, y = n)) +
+  geom_segment(aes(x = clean, xend = clean, y = 0, yend = n),
+               color = "forestgreen", linewidth = 0.7) +
+  geom_point(color = "forestgreen", size = 3) +
+  geom_text(aes(label = n), hjust = -0.8, size = 4) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title = "Most frequent words in pollution snippets (cleaned)",
+    subtitle = "Numbers, possessives, and context-specific stop words removed",
+    x = NULL,
+    y = "Number of occurrences",
+    caption = "Data source: New York Times Article Search API"
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 14, color = "gray15"),
+    plot.caption = element_text(hjust = 1, color = "black", size = 12,
+                                   face = "italic", margin = margin(t = 10)),
+    axis.title.x = element_text(size = 12),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12)
+  )
+```
+
+After cleaning, words like "pollution", "air", "water", "climate", "health", "chemical", and "environmental" rise to the top. These directly reflect what the articles are about, which confirms the cleaning steps worked as intended.
+
+---
+
+## Headline analysis: Publications per day and word frequency
+
+Here I repeated the same analysis using the `headline` column instead of `snippet`. Headlines are much shorter than snippets, so the vocabulary is more compressed. Comparing the two gives a sense of how much information is lost when you only look at headlines.
+
+### Publications per day (headlines)
+
+Since headlines and snippets come from the same set of articles, the daily article counts are identical across both plots. The difference between the two analyses shows up in the word frequency plots below, not here.
+
+```{r date-plot-headline, fig.width=10, fig.height=7}
+# aggregate article counts by publication day using headline data
+headline_day <- nytData %>%
+  mutate(pubDay = as.Date(created_time)) %>%
+  group_by(pubDay) %>%
+  summarise(count = n()) %>%
+  filter(count >= 2) %>%
+  arrange(pubDay) %>%
+  mutate(pubDay = factor(pubDay, levels = pubDay))
+
+# plot daily article counts from headlines as a vertical bar chart
+ggplot(headline_day, aes(x = pubDay, y = count)) +
+  geom_col(fill = "hotpink4") +
+  geom_text(aes(label = count), vjust = -0.5, size = 4, color = "hotpink4") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    x = NULL,
+    y = "Number of articles",
+    title = "How often did the NYT cover pollution in headlines? (2016-2025)",
+    subtitle = "Each bar represents a day with 2 or more published articles mentioning pollution",
+    caption = "Data source: New York Times Article Search API"
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 14),
+    plot.caption = element_text(hjust = 1, color = "black", size = 12,
+                                   face = "italic", margin = margin(t = 10)),
+    axis.title.y = element_text(size = 12),
+    axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 12)
+  )
+```
+
+### Word frequency in headlines
+
+```{r headline-tokens, fig.width=10, fig.height=7}
+# tokenize headlines, remove stop words, and apply the same cleaning as snippets
+headline_tokens <- nytData %>%
+  unnest_tokens(word, headline) %>%
+  anti_join(stop_words, by = "word") %>%
+  mutate(clean = str_remove_all(word, "[:digit:]"),
+         clean = gsub("'s", "", clean),
+         clean = gsub("\u2019s", "", clean)) %>%
+  filter(clean != "") %>%
+  filter(!clean %in% custom_stops)
+
+# plot cleaned headline word frequencies as a horizontal bar chart
+headline_tokens %>%
+  count(clean, sort = TRUE) %>%
+  filter(n > 3) %>%
+  mutate(clean = reorder(clean, n)) %>%
+  ggplot(aes(x = clean, y = n)) +
+  geom_col(fill = "deepskyblue4") +
+  geom_text(aes(label = n), hjust = -0.3, size = 4) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title = "Most frequent words in pollution headlines (cleaned)",
+    subtitle = "Numbers, possessives, and context-specific stop words removed",
+    x = NULL,
+    y = "Number of occurrences",
+    caption = "Data source: New York Times Article Search API"
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 14),
+    plot.caption = element_text(hjust = 1, color = "black", size = 12,
+                                   face = "italic", margin = margin(t = 10)),
+    axis.title.x = element_text(size = 12),
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12)
+  )
+```
+
+---
+
+## **Comparing snippet and headline word frequencies**
+
+Looking at both word frequency plots side by side, there are some clear differences.
+
+Headlines are short. They are written to tell you the topic in as few words as possible, so only the most central words show up. Terms like "pollution", "air", and "water" dominate because that is all a headline has space for.
+
+Snippets are longer and come from the first sentence or two of the article. Because of that extra length, more specific words appear. Things like "health", "chemical", "city", "report", and agency names show up more often in snippets than in headlines. Snippets also tend to include location names and descriptions of what actually happened.
+
+The bottom line is that headlines tell us the topic and snippets start to tell us the story. If we were building a text classifier or trying to understand what these articles are actually about, snippets would give us much more to work with. Headlines alone would give us a pretty thin picture.

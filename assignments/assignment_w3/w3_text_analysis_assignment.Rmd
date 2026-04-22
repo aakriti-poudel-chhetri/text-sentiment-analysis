@@ -1,0 +1,346 @@
+---
+title: "Assignment: Text Analysis of Nexis Uni Data"
+author: "Aakriti Poudel"
+date: "April 20, 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Load libraries
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(tidyverse)          # data wrangling and plotting
+library(tidytext)           # text mining in tidy format
+library(SnowballC)          # Porter stemmer
+library(textstem)           # lemmatization
+library(scales)             # axis formatting
+library(lubridate)          # date handling
+library(quanteda)           # corpus and DFM construction
+library(quanteda.textstats) # textstat_keyness()
+library(quanteda.textplots) # textplot_keyness()
+```
+
+## Load and clean data
+
+```{r load-data}
+# Read the data directly from GitHub
+url <- "https://raw.githubusercontent.com/MaRo406/EDS-231-text-sentiment/refs/heads/main/data/nexis-dat.csv"
+results <- read_csv(url)
+df <- results
+
+# Drop rows with no date (these are often metadata rows, not real articles)
+df <- df[!is.na(df$date), ]
+
+# Remove URLs that Nexis embeds inline in article text
+df$text <- gsub("https?\\S+", "", df$text)
+
+# Convert special characters (curly quotes, em-dashes) to plain ASCII
+df$text <- iconv(df$text, to = "ASCII//TRANSLIT", sub = "")
+
+# Remove possessives so "center's" becomes "center"
+df$text <- gsub("'s\\b", "", df$text, ignore.case = TRUE)
+```
+
+## Tokenization
+
+```{r tokenize}
+# Split each article into one word per row (one-token-per-row format)
+tokens <- df %>% 
+  select(id, date, source, text) %>%
+  unnest_tokens(output = word, input = text, token = "words")
+```
+
+## Stopword removal
+
+```{r stopwords}
+# Load the SMART stopword list 
+standard_sw <- get_stopwords(source = "smart")
+
+# Remove standard stopwords
+tokens_clean <- tokens %>%
+  anti_join(standard_sw, by = "word")
+
+# Build a domain-specific stopword list for news about data centers
+domain_sw <- tibble(word = c(
+  # News wire boilerplate — attribution phrases that appear in almost every article
+  "said", "says", "told", "according", "reported", "noted", "added",
+  "stated", "announced", "mr", "ms", "inc", "corp", "llc",
+  # Generic business and quantity terms that are not specific to this topic
+  "year", "years", "percent", "million", "billion", "quarter",
+  "company", "companies", "firm", "business",
+  # Core topic words treated as boilerplate since every article contains them
+  "data", "center", "centers"
+))
+
+# Remove domain stopwords, pure numbers, and very short tokens
+tokens_clean2 <- tokens_clean %>%
+  anti_join(domain_sw, by = "word") %>%
+  filter(
+    !str_detect(word, "^[0-9]+$"),  # remove tokens that are only digits
+    str_length(word) > 2            # remove tokens shorter than 3 characters
+  )
+```
+
+## Lemmatization
+
+```{r lemmatize}
+# Reduce each word to its base form (e.g., "buildings" and "building" both become "build")
+tokens_lemmatized <- tokens_clean2 %>%
+  mutate(lemma = lemmatize_words(word))
+
+# Replace the original word column with the lemma for all downstream analysis
+working_tokens <- tokens_lemmatized %>%
+  mutate(word = lemma) %>%
+  select(-lemma)
+```
+
+---
+
+## 7. Interpretive questions
+
+### Question 1: What do the most positive keywords (overrepresented in 2025) tell you about how data center coverage has shifted?
+
+The words overrepresented in 2025 (such as "power", "electricity", "nuclear", "grid", and "tariffs") show that news coverage of data centers has moved away from technology topics towards energy and politics.
+
+In 2021, articles focused on things like "cloud", "networks", "security", and "bitcoin". By 2025, reporters were writing more about how much electricity data centers use and what that means for the power grid. Words like "nuclear" and "fusion" suggest that journalists started asking where all that electricity would come from. Words like "tariffs" show that data centers also became part of trade and policy debates.
+
+In short, the coverage shifted from treating data centers as a technology topic to treating them as an energy and policy topic.
+
+### Question 2: Are any of these keywords surprising? What might explain their appearance?
+
+"Trump", "bannon", "marcos", and "altman" are somewhat surprising in a corpus about data centers. Their presence reflects how data center investment announcements became directly tied to political figures and tech executives in 2025. Political figures made data center policy a governance topic, which brought their names into the coverage.
+
+"Fusion" is also interesting. It suggests that the electricity demand from data centers grew large enough to bring nuclear fusion research into the news conversation, even though fusion power is not yet commercially available. This shows how journalists were reaching for future energy solutions to explain how these facilities could be powered.
+
+### Question 3: How would you check whether a keyword is genuinely distributed across the corpus rather than concentrated in one source?
+
+A high G² score means a word appears more in 2025 than in 2021, but that spike may also come from just one newspaper running many articles on the topic.
+
+To check whether a keyword is genuinely spread across the corpus, I would:
+
+1. **Count how many unique sources use the word:** If "fusion" appears in 20 different outlets, it is truly widespread. If it only appears in one outlet 50 times, it is a single source artifact.
+
+2. **Calculate the share of documents containing the word:** A word appearing in 60% of 2025 articles is much more representative than one appearing in only 3% of articles.
+
+The code below checks both for the word "nuclear".
+
+```{r check-keyword-spread}
+# Count how many unique articles and sources contain the word "nuclear" in 2025
+working_tokens %>%
+  filter(year(date) == 2025, word == "nuclear") %>%
+  summarise(
+    n_articles = n_distinct(id), # number of unique articles with this word
+    n_sources = n_distinct(source), # number of unique outlets with this word
+    total_count = n()) # total occurrences across all articles
+```
+
+If `n_sources` is high relative to the total number of sources in 2025, the keyword is genuinely distributed. If `n_sources` is 1 or 2, the word is concentrated in one outlet and should be interpreted with caution.
+
+### Question 4: How has the language used to describe data centers changed over time, and what does that suggest about the evolving journalistic frame?
+
+In 2021, the language around data centers was dominated by terms like "cloud", "network", "internet", "services", and "security". The journalists framed that data centers are part of the digital economy.
+
+By 2025, the dominant language shifted to "power", "energy", "electricity", "nuclear", "grid", and "infrastructure". The frame became that data centers are large physical facilities that consume enormous amounts of electricity and have real consequences for the power grid and energy policy.
+
+This shift reflects a change in how journalists understood data centers, moving from seeing them as invisible background technology to seeing them as major infrastructure projects comparable to highways or power plants. The appearance of political language such as tariffs, regulation, and named politicians confirms that data centers moved from a technology story to a story about infrastructure and public policy.
+
+---
+
+## 8. Exercises
+
+### Exercise 1: Stopword sensitivity
+
+**Question:** Remove all domain-specific stopwords and re-run the frequency plot. Then add 10 more domain stopwords beyond what was provided. How do your results change? What does this tell you about the analytical choices embedded in preprocessing?
+
+First, re-run the frequency plot with only the standard SMART stopwords removed and no domain stopwords applied.
+
+```{r ex1-no-domain-sw}
+# Plot the top 30 words using only standard stopword removal, shows what remains before any domain-specific cleaning
+tokens_clean %>%
+  count(word, sort = TRUE) %>%
+  slice_head(n = 30) %>%
+  ggplot(aes(x = reorder(word, n), y = n)) +
+  geom_col(fill = "orange3") +
+  coord_flip() +
+  labs(title = "Top 30 Words, No Domain Stopwords",
+       subtitle = "Only standard SMART list applied",
+       x = NULL, y = "Frequency") +
+  theme_minimal(base_size = 12)
+```
+
+Now add 10 more domain stopwords beyond the original list and re-run the frequency plot.
+
+```{r ex1-extended-sw}
+# Ten additional stopwords identified by inspecting the frequency plot above
+# These words are frequent but do not tell us anything specific about data centers
+extra_sw <- tibble(word = c(
+  "people",   # too generic to be informative
+  "time",     # too generic to be informative
+  "state",    # ambiguous: could mean a US state or a general condition
+  "make",     # generic verb
+  "work",     # generic verb
+  "world",    # too broad to be informative
+  "large",    # generic adjective
+  "high",     # generic adjective
+  "thing",    # generic noun
+  "include"   # generic verb common in boilerplate sentences
+))
+
+# Combine the original domain stopwords with the 10 new ones
+all_domain_sw <- bind_rows(domain_sw, extra_sw)
+
+# Apply the extended stopword list, remove numbers and short tokens, then lemmatize
+tokens_extended <- tokens_clean %>%
+  anti_join(all_domain_sw, by = "word") %>%
+  filter(
+    !str_detect(word, "^[0-9]+$"),
+    str_length(word) > 2
+  ) |>
+  mutate(word = lemmatize_words(word))
+
+# Plot the top 30 words after extended stopword removal
+tokens_extended %>%
+  count(word, sort = TRUE) %>%
+  slice_head(n = 30) %>%
+  ggplot(aes(x = reorder(word, n), y = n)) +
+  geom_col(fill = "#756bb1") +
+  coord_flip() +
+  labs(title = "Top 30 Words, Extended Domain Stopwords",
+       subtitle = "Original + 10 additional domain stopwords removed",
+       x = NULL, y = "Frequency") +
+  theme_minimal(base_size = 12)
+```
+
+Removing the additional generic words pushes more meaningful terms (like "energy", "power", "technology", "infrastructure", and "investment") higher in the list. The results become more specific to the actual content of the articles.
+
+This exercise shows that every stopword decision is an analytical choice. Removing "state" might be justified if it is mostly used as a generic word, but it would be a mistake if the research question is about state level energy policy. These choices must be based on the research question and clearly documented.
+
+
+### Exercise 2: Alternative keyness, compare top two sources
+
+**Question:** Instead of comparing time periods, compare the two sources with the most articles. What does keyness reveal about how each publication frames the data center beat?
+
+```{r ex2-keyness-sources}
+# Find the two sources with the most articles in the corpus
+top2_sources <- df %>%
+  count(source, sort = TRUE) %>%
+  slice_head(n = 2) %>%
+  pull(source)
+
+cat("Top 2 sources:\n")
+print(top2_sources)
+
+# Keep only articles from those two sources
+df_top2 <- df %>%
+  filter(source %in% top2_sources)
+
+# Build a quanteda corpus using article ID as the document identifier
+corp2 <- corpus(df_top2, docid_field = "id", text_field = "text")
+
+# Store the source name as a document variable so we can group by it later
+docvars(corp2, "outlet") <- df_top2$source
+
+# Tokenize: remove punctuation, numbers, and symbols, then convert to lowercase
+toks2 <- tokens(corp2,
+  remove_punct   = TRUE,
+  remove_numbers = TRUE,
+  remove_symbols = TRUE) %>%
+  tokens_tolower() %>%
+  tokens_remove(stopwords("en", source = "smart"))  # remove standard stopwords
+
+# Build the document-feature matrix (one row per article, one column per word)
+dfmat2 <- dfm(toks2)
+
+# Collapse to one row per outlet so we can compare the two sources directly
+dfmat2_grouped <- dfm_group(dfmat2, groups = outlet)
+
+# Compute keyness with NYT as the target and CE Noticias as the reference
+# G² (log-likelihood ratio) is used because it handles sparse counts better than chi-squared
+result2 <- textstat_keyness(dfmat2_grouped,
+                            target  = "The New York Times",
+                            measure = "lr")
+
+# Extract top 20 overrepresented words for each source and plot keyness
+result2 %>% 
+  slice(c(1:20, (nrow(result2) - 19):nrow(result2))) %>% 
+  mutate(direction = if_else(G2 > 0, "New York Times", "CE Noticias Financieras English"),
+         feature = reorder(feature, G2)) %>% 
+  ggplot(aes(x = feature, y = G2, fill = direction, label = feature)) +
+  geom_col(width = 0.8) +
+  geom_text(aes(hjust = if_else(G2 > 0, -0.1, 1.1)), size = 3) +
+  coord_flip() +
+  scale_fill_manual(values = c("New York Times" = "#2166ac", "CE Noticias Financieras English" = "#d73027"),
+                    name = NULL) +
+  scale_y_continuous(expand = expansion(mult = 0.3)) +
+  labs(title = "Keyness: NYT vs. CE Noticias Financieras",
+       subtitle = "Target: New York Times | Reference: CE Noticias | Statistic: G²",
+       x = NULL, y = "G²") +
+  theme_light(base_size = 12) +
+  theme(legend.position = "top",
+        panel.grid.major.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+
+```
+
+The New York Times frames data centers through a political and energy lens. Words like "trump", "pennsylvania", "grid", "electricity", and "nuclear" are characteristic of NYT coverage. This reflects a focus on domestic policy questions such as how much power data centers use, who decides where they are built, and what that means for local communities and the power grid.
+
+CE Noticias Financieras uses language more typical of financial reporting. Terms like "investment", "market", "service", "project", and "global" are more common there. Their coverage frames data centers as business and investment stories with an international angle.
+
+This comparison shows how the same topic gets framed very differently depending on the outlet's audience and focus.
+
+### Exercise 3: Bigrams
+
+**Question:** Use unnest_tokens(token = "ngrams", n = 2) to extract bigrams. What are the 20 most frequent bigrams? Do they reveal entities or conceptual phrases that single-token analysis misses?
+
+```{r ex3-bigrams}
+# Extract two-word phrases (bigrams) from each article
+bigrams <- df %>%
+  select(id, date, source, text) %>%
+  unnest_tokens(output = bigram,
+                input = text,
+                token = "ngrams",
+                n = 2)
+
+# Split each bigram into two separate columns so we can filter each word independently
+bigrams_sep <- bigrams %>%
+  separate(bigram, into = c("word1", "word2"), sep = " ")
+
+# Get the SMART stopword list as a plain character vector for filtering
+smart_words <- get_stopwords(source = "smart")$word
+
+# Remove bigrams where either word is a stopword, a pure number, or very short
+bigrams_filtered <- bigrams_sep %>%
+  filter(
+    !word1 %in% smart_words,
+    !word2 %in% smart_words,
+    !str_detect(word1, "^[0-9]+$"),
+    !str_detect(word2, "^[0-9]+$"),
+    str_length(word1) > 2,
+    str_length(word2) > 2) %>%
+  # Rejoin the two words back into a single bigram string
+  unite(bigram, word1, word2, sep = " ")
+
+# Count and plot the top 20 most frequent bigrams
+bigrams_filtered %>%
+  count(bigram, sort = TRUE) %>%
+  slice_head(n = 20) %>%
+  ggplot(aes(x = reorder(bigram, n), y = n)) +
+  geom_col(fill = "#2166ac") +
+  coord_flip() +
+  labs(title = "Top 20 Bigrams, Data Center Corpus",
+    subtitle = "Stopwords removed from both word positions",
+    x = NULL, y = "Count") +
+  theme_minimal(base_size = 12)
+```
+
+Bigrams reveal meaningful phrases and place names that single-word analysis breaks apart. For example, "nuclear power" and "power plant" clarify what the word "power" actually refers to in context, which is lost when only counting single words. Geographic phrases like "new york" and "united states" identify locations that matter to the story. Phrases like "renewable energy" reveal an environmental angle that is invisible when words are counted individually.
+
+In short, bigrams are useful for finding place names, policy terms, and topic phrases that only make sense as a pair of words.
