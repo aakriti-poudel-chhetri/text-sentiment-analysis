@@ -1,0 +1,451 @@
+---
+title: "Lab 5 Assignment"
+author: "Aakriti Poudel"
+date: "2026-05-16"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+#  Lab 5 Inclass
+
+```{r packages, include=FALSE}
+library(tidytext)
+library(tidyverse)
+library(tidymodels)
+library(textrecipes)
+library(naivebayes)
+library(discrim)
+library(glmnet)
+library(ranger)
+library(vip)
+library(doParallel)
+```
+
+This full data set includes more possible predictors than the text alone, but for this model we will only use the text variable.
+
+```{r data}
+urlfile <- "https://raw.githubusercontent.com/MaRo406/EDS-231-text-sentiment/main/data/climbing_reports_model_dat.csv"
+incidents_df <- readr::read_csv(url(urlfile))
+```
+
+```{r examine-data}
+glimpse(incidents_df)
+
+# How many incidents are marked as deadly?
+incidents_df |>
+  count(Deadly, name = "n")
+```
+
+Now we'll split our data into training and test portions.
+
+```{r split-data}
+set.seed(321)
+incidents2class <- incidents_df |>
+  mutate(deadly = factor(if_else(
+    is.na(Deadly),
+    "non-deadly", "deadly"
+  )))
+
+# Split our data
+incidents_split <- initial_split(incidents2class, prop = 0.8, strata = deadly)
+
+incidents_train <- training(incidents_split)
+incidents_test  <- testing(incidents_split)
+```
+
+We use `recipe()` to specify the predictor and outcome variables and the data.
+
+```{r recipe}
+incidents_rec <- recipe(deadly ~ Text, data = incidents_train)
+```
+
+Next we add some familiar pre-processing steps on our Text variable: tokenize to word level, filter to the most common words, and calculate tf-idf.
+
+```{r pre-process}
+recipe <- incidents_rec |>
+  step_tokenize(Text) |>
+  step_tokenfilter(Text, max_tokens = 1000) |>
+  step_tfidf(Text)
+```
+
+> **Python parallel:** This three-step recipe maps almost directly onto a single sklearn object: `TfidfVectorizer(max_features=1000)`.
+
+```{r nb-spec}
+nb_spec <- naive_Bayes() %>%
+  set_mode("classification") %>%
+  set_engine("naivebayes")
+```
+
+Time for model evaluation. We'll do a standard resampling process to evaluate our naive Bayes model. Here we create 10-fold cross-validation sets, and use them to estimate performance. `vfold_cv()` lets us do this.
+
+```{r cv-folds}
+set.seed(123)
+incidents_folds <- vfold_cv(incidents_train)
+
+incidents_folds
+```
+
+Create a tidymodels workflow to combine the modeling components.
+
+> **Python parallel:** A `workflow()` is the tidymodels equivalent of `sklearn.pipeline.Pipeline`. Both bundle preprocessing and a model estimator into a single object that can be fit, cross-validated, and used for prediction in one call.
+
+```{r nb-workflow}
+nb_wf <- workflow() |>
+  add_recipe(recipe) |>
+  add_model(nb_spec)
+```
+
+To estimate its performance, we fit the model to each of the resampled folds, and then evaluate on the held-out part of each resampled fold.
+
+```{r fit-resamples}
+nb_rs <- tune::fit_resamples(
+  nb_wf,
+  incidents_folds,
+  control = control_resamples(save_pred = TRUE)
+)
+```
+
+> **Python parallel:** `fit_resamples()` is doing what `cross_validate(pipeline, X, y, cv=kfold, scoring=['accuracy','roc_auc'], return_estimator=True)` does in sklearn — fitting the full pipeline (preprocessing + model) on each training fold and scoring on the held-out fold.
+
+Extract the relevant information using `collect_metrics()` and `collect_predictions()` and examine the performance metrics.
+
+```{r performance}
+nb_rs_metrics     <- collect_metrics(nb_rs)
+nb_rs_predictions <- collect_predictions(nb_rs)
+nb_rs_metrics
+```
+
+We'll use two performance metrics: accuracy and ROC AUC. Accuracy is the proportion of the data that is predicted correctly. The ROC curve plots the true positive rate against the false positive rate; AUC closer to 1 indicates a better-performing model, while AUC closer to 0.5 indicates a model that does no better than random guessing.
+
+```{r performance-plot}
+nb_rs_predictions %>%
+  group_by(id) %>%
+  roc_curve(truth = deadly, .pred_deadly) %>%
+  autoplot() +
+  labs(
+    color = "Resamples",
+    title = "ROC curve for climbing incident reports using Naive Bayes"
+  )
+```
+
+Another model method involves the confusion matrix. A confusion matrix tabulates a model's false positives and false negatives for each class.
+
+```{r confusion-matrix-nb}
+conf_mat_resampled(nb_rs, tidy = FALSE) %>%
+  autoplot(type = "heatmap")
+```
+
+Hmm, let's try a different model.
+
+Lasso classification uses regularization on regression to produce a simpler, more generalizable model. It learns how much of a penalty to apply to features, reducing the high-dimensional space of tokens — sometimes shrinking coefficients all the way to 0, effectively removing those features from the model entirely.
+
+The penalty is a hyperparameter we need to choose. Rather than setting it manually, we estimate its best value by fitting models across 30 candidate penalty values on our resampled data and comparing performance.
+
+```{r penalty-tuning-specification}
+tune_spec <- logistic_reg(penalty = tune(), mixture = 1) %>%
+  set_mode("classification") %>%
+  set_engine("glmnet")
+
+tune_spec
+```
+
+Here we use `grid_regular()` to create 30 possible values for the regularization penalty. Then `tune_grid()` fits a model at each of those values.
+
+```{r lambda-grid}
+lambda_grid <- grid_regular(penalty(), levels = 30)
+
+lambda_grid
+```
+
+> **Python parallel:** `grid_regular(penalty(), levels = 30)` + `tune_grid()` is akin to using `GridSearchCV()`.
+
+```{r tune}
+lasso_wf <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(tune_spec)
+
+set.seed(2023)
+tune_rs <- tune_grid(
+  lasso_wf,
+  incidents_folds,
+  grid = lambda_grid,
+  control = control_resamples(save_pred = TRUE)
+)
+```
+
+```{r plot-metrics}
+collect_metrics(tune_rs)
+autoplot(tune_rs) +
+  labs(title = "Lasso performance across regularization penalties")
+```
+
+```{r penalty-show-best}
+tune_rs %>%
+  show_best(metric = "roc_auc")
+
+tune_rs %>%
+  show_best(metric = "accuracy")
+
+chosen_acc <- tune_rs %>%
+  select_by_one_std_err(metric = "accuracy", -penalty)
+```
+
+Next, let's finalize our workflow with this particular regularization penalty. This is the regularization penalty that our tuning results indicate gives us the best model.
+
+```{r final-model}
+final_lasso <- finalize_workflow(lasso_wf, chosen_acc)
+
+final_lasso
+```
+
+The penalty argument value now reflects our tuning result. Now we fit to our training data.
+
+```{r fit-lasso}
+fitted_lasso <- fit(final_lasso, incidents_train)
+
+fitted_lasso
+```
+
+First let's look at the words associated with an accident being non-deadly.
+
+```{r words-non-deadly}
+fitted_lasso |>
+  extract_fit_parsnip() |>
+  tidy() |>
+  filter(estimate > 0) |>
+  arrange(-estimate) |>
+  slice_head(n = 20)
+```
+
+And now the words that are most associated with a deadly incident.
+
+```{r words-deadly}
+fitted_lasso |>
+  extract_fit_parsnip() |>
+  tidy() |>
+  filter(estimate < 0) |>
+  arrange(estimate) |>
+  slice_head(n = 20)
+```
+
+Finally, let's fit to the test data and see how we did.
+
+```{r lasso-test-eval}
+last_fit(final_lasso, incidents_split) %>%
+  collect_metrics()
+```
+
+
+
+# Lab 5 Assignment
+
+### Language & Tools
+
+This assignment is completed in R using the tidymodels framework demonstrated above. The chosen third classifier is a **Random Forest** via the `ranger` engine.
+
+### AI Use
+
+All AI-assisted code blocks are clearly flagged with inline comments.
+
+
+## **1. Select a third classification algorithm beyond Naive Bayes and Lasso (e.g., random forest, k-nearest neighbors, support vector machine, decision tree). Report its cross-validated accuracy and ROC AUC.**
+
+I choose **Random Forest**.
+
+A random forest is a group of many simple decision making trees, each trained on a slightly different slice of the data. Each tree casts a vote, and the most popular vote wins.
+
+The key idea is that each tree only looks at a random handful of words at each step, not all of them. This forces the trees to be different from each other, and when you average out many different opinions, you tend to get a more reliable answer than any single tree would give you.
+
+For predicting whether a climbing incident was fatal, this helps because the model can pick up on combinations of words that together signal danger, something the other two models struggle with.
+
+```{r rf-spec}
+# Claude: asked for help setting up a ranger random forest spec in tidymodels
+rf_spec <- rand_forest(
+  mtry  = tune(),
+  trees = 500,
+  min_n = tune()) %>%
+  set_mode("classification") %>%
+  set_engine("ranger", importance = "impurity")
+```
+
+```{r rf-workflow}
+rf_wf <- workflow() %>%
+  add_recipe(recipe) %>%
+  add_model(rf_spec)
+```
+
+```{r rf-tune}
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+# Claude: smaller grid (3x3 = 9 combos) to reduce run time
+rf_grid <- grid_regular(
+  mtry(range = c(5, 20)),
+  min_n(range = c(2, 10)),
+  levels = 3
+)
+
+set.seed(456)
+rf_tune_rs <- tune_grid(
+  rf_wf,
+  resamples = incidents_folds,
+  grid      = rf_grid,
+  control   = control_resamples(save_pred = TRUE)
+)
+
+stopImplicitCluster()
+```
+
+```{r rf-metrics}
+collect_metrics(rf_tune_rs)
+autoplot(rf_tune_rs) +
+  labs(title = "Random Forest performance across mtry and min_n")
+```
+
+```{r rf-best}
+rf_tune_rs %>% show_best(metric = "roc_auc")
+rf_tune_rs %>% show_best(metric = "accuracy")
+```
+
+**Interpretation:**
+
+During cross-validation, the Random Forest got about 83% of its predictions correct (accuracy = 0.830). It also scored 0.947 on ROC AUC, which measures how well the model separates deadly from non-deadly incidents, a score of 1.0 would be perfect, so 0.947 is very strong.
+
+These numbers look impressive, but they do not tell the whole story. We will perform confusion matrix to see whether model is quietly struggling with actually catching fatal incidents.
+
+
+## **2. Identify the key hyperparameter(s) for your chosen algorithm. Tune at least one hyperparameter using cross-validation and select a final value. Briefly explain in plain language what the hyperparameter controls and why tuning it matters.**
+
+A random forest has two key hyperparameters tuned here:
+
+**`mtry`:** The number of words the model is allowed to look at when making each decision. If this number is small, each tree makes decisions based on fewer words, so the trees end up being very different from each other, which is good, because averaging different opinions gives a more reliable result. If this number is large, all the trees start looking too similar and we lose that benefit. We tune this setting to find the place where the trees are different enough to be useful but still accurate.
+
+**`min_n`:** The minimum number of incidents a group must have before the model tries to split it further. If this number is large, the model stops splitting early and keeps things simple. If this number is small, the model keeps splitting until the groups are very small, which can cause it to memorize random quirks in the training data rather than learning real patterns. Since we have many more non-deadly incidents than deadly ones in this dataset, setting this a bit higher helps make sure the model does not just learn to always predict the more common outcome.
+
+We used a method called the one standard error rule to pick the final values. Instead of just taking the single best performing combination, this rule picks the simplest model that is still within a reasonable margin of the best. The idea is that a slightly simpler model tends to hold up better on new data it has never seen before.
+
+```{r rf-select-final}
+chosen_rf <- rf_tune_rs %>%
+  select_by_one_std_err(metric = "roc_auc", desc(mtry))
+
+chosen_rf
+```
+
+
+## **3. Fit your final tuned model and evaluate it on the test set. Compare its accuracy and ROC AUC to the Naive Bayes and Lasso models from the demo. Which model performs best, and why do you think that is?**
+
+```{r rf-finalize}
+final_rf <- finalize_workflow(rf_wf, chosen_rf)
+
+final_rf
+```
+
+```{r rf-fit-train}
+fitted_rf <- fit(final_rf, incidents_train)
+
+fitted_rf
+```
+
+```{r compare-test-performance}
+# Naive Bayes test evaluation
+nb_test <- last_fit(nb_wf, incidents_split) %>%
+  collect_metrics() %>%
+  mutate(model = "Naive Bayes")
+
+# Lasso test evaluation
+lasso_test <- last_fit(final_lasso, incidents_split) %>%
+  collect_metrics() %>%
+  mutate(model = "Lasso")
+
+# Random Forest test evaluation
+rf_test <- last_fit(final_rf, incidents_split) %>%
+  collect_metrics() %>%
+  mutate(model = "Random Forest")
+
+# Combine for side-by-side comparison
+comparison_tbl <- bind_rows(nb_test, lasso_test, rf_test) %>%
+  select(model, .metric, .estimate) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate)
+
+comparison_tbl
+```
+
+**Interpretation:**
+
+When we compare all three models, the results are interesting.
+
+The Random Forest was best at separating deadly from non-deadly incidents overall, it scored the highest ROC AUC of 0.963. Think of ROC AUC as how good the model is at ranking, a higher score means it is better at putting deadly incidents at the top and non-deadly ones at the bottom.
+
+However, the Lasso was more accurate in terms of simply getting the right label, it correctly classified 91.9% of all incidents, compared to 84.9% for the Random Forest. One reason for this is that we gave Lasso more tuning options. We tested 30 different settings for it, but only 9 for the Random Forest. More tuning generally leads to better accuracy.
+
+Naive Bayes came in last on both scores, 79.6% accuracy and 0.783 ROC AUC. This is because it treats every word as if it has nothing to do with the other words in the report, which is not how real writing works. Words like "died", "body" and "unroped" tend to appear together in fatal incident reports, and Naive Bayes simply cannot pick up on those patterns.
+
+
+## **4. Examine the confusion matrix for your tuned model. What does the confusion matrix tell you about how the model is handling the minority class? Is overall accuracy a good summary metric here? What would you prioritize, minimizing false negatives (missed fatalities) or false positives (false alarms) and why?**
+
+```{r rf-confusion-matrix}
+# Finalize the workflow and refit on folds for the confusion matrix
+final_rf <- finalize_workflow(rf_wf, chosen_rf)
+
+set.seed(456)
+final_rf_rs <- fit_resamples(
+  final_rf,
+  resamples = incidents_folds,
+  control   = control_resamples(save_pred = TRUE)
+)
+
+conf_mat_resampled(final_rf_rs, tidy = FALSE) %>%
+  autoplot(type = "heatmap") +
+  labs(title = "Random Forest - Averaged Confusion Matrix (CV folds)")
+```
+
+```{r rf-test-confusion}
+rf_test_preds <- last_fit(final_rf, incidents_split) %>%
+  collect_predictions()
+
+rf_test_preds %>%
+  conf_mat(truth = deadly, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") +
+  labs(title = "Random Forest - Test-Set Confusion Matrix")
+```
+
+```{r rf-test-roc}
+rf_test_preds %>%
+  roc_curve(truth = deadly, .pred_deadly) %>%
+  autoplot() +
+  labs(title = "Random Forest - Test-Set ROC Curve")
+```
+
+```{r class-recall}
+rf_test_preds %>%
+  metrics(truth = deadly, estimate = .pred_class)
+
+rf_test_preds %>%
+  sensitivity(truth = deadly, estimate = .pred_class, event_level = "first")
+
+rf_test_preds %>%
+  specificity(truth = deadly, estimate = .pred_class, event_level = "first")
+```
+
+**Interpretation:**
+
+The test-set confusion matrix tells a following:
+
+- **26** deadly incidents were correctly identified as deadly
+- **87** deadly incidents were wrongly labeled as non-deadly
+- **442** non-deadly incidents were correctly identified
+- **0** non-deadly incidents were wrongly flagged as deadly
+
+This means the model missed 77% of all actual fatalities. It only caught 26 out of 113 deadly incidents. The sensitivity score of 0.23 confirms this. The model is quietly failing at the most important task.
+
+At the same time, the specificity is a perfect 1.0, meaning the model never once called a non-deadly incident deadly. This extreme pattern, never wrong in one direction and almost always wrong in the other, is a direct result of the class imbalance. There are roughly four times as many non-deadly incidents as deadly ones, so the model learned that the safest bet is almost always to predict "non-deadly." Because that guess is right most of the time, the overall accuracy looks decent at 84%. But that number is deeply misleading, a model that predicted "non-deadly" for every single report would also score around 80% accuracy without learning anything at all.
+
+**Is overall accuracy a good metric here?** No. Accuracy treats a missed fatality and a missed non-deadly incident as the same size of mistake. They are not.
+
+**What should we prioritize, missing fatalities or false alarms?** We should prioritize catching fatalities, even if that means flagging some non-deadly incidents incorrectly. In any realistic use of this tool, for example, a system that automatically flags climbing reports for safety review, a false alarm costs a reviewer some extra time. A missed fatality could mean a real accident pattern goes unnoticed, an investigation is delayed, or a preventable death is not learned from. To fix this in practice, we would need to re-weight the classes during training, lower the decision threshold so more incidents get flagged as deadly, or use recall as the primary metric during tuning rather than accuracy.

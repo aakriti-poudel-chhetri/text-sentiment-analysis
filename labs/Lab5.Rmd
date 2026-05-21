@@ -23,15 +23,15 @@ This full data set includes more possible predictors than the text alone, but fo
 ```{r data}
 
 urlfile ="https://raw.githubusercontent.com/MaRo406/EDS-231-text-sentiment/main/data/climbing_reports_model_dat.csv"
-
 incidents_df<-readr::read_csv(url(urlfile))
 ```
 
 ```{r examine-data}
 glimpse(incidents_df)
+
 # How many incidents are marked as deadly?
 
-incidents_df <- incidents_df %>% 
+incidents_df |>
   count(Deadly, name = "n")
 
 ```
@@ -40,18 +40,17 @@ Now we'll split our data into training and test portions
 
 ```{r split-data}
 set.seed(321)
-incidents2class <- incidents_df %>% 
-  mutate(Deadly = factor(if_else(
+incidents2class <- incidents_df |>
+  mutate(deadly = factor(if_else(
     is.na(Deadly),
     "non-deadly", "deadly"
   )))
 
-#split our data
+# Split our data
 incidents_split <- initial_split(incidents2class, prop = 0.8, strata = deadly)
 
 incidents_train <- training(incidents_split)
-incidents_test <- testing(incidents_split)
-
+incidents_test  <- testing(incidents_split)
 ```
 
 We use recipe() to specify the predictor and outcome variables and the data.
@@ -63,24 +62,15 @@ incidents_rec <- recipe(deadly ~ Text, data = incidents_train)
 Next we add some familiar pre-processing steps on our Text variable: tokenize to word level, filter to the most common words, and calculate tf-idf.
 
 ```{r pre-process}
-recipe <- incidents_rec %>% 
-  step_tokenize(Text) %>%
-  step_tokenfilter(text, max_tokens = 1000) %>% 
-  step_tfidf()
+recipe <- incidents_rec |> 
+  step_tokenize(Text) |> 
+  step_tokenfilter(Text, max_tokens = 1000) |> 
+  step_tfidf(Text)
 
 recipe
-                  
 ```
 
 > **Python parallel:** This three-step recipe maps almost directly onto a single sklearn object: `TfidfVectorizer(max_features=1000)`.
-
-Create a tidymodels workflow to combine the modeling components
-
-```{r workflow}
-incidents_wf <- 
-```
-
-> **Python parallel:** A `workflow()` is the tidymodels equivalent of `sklearn.pipeline.Pipeline`. Both bundle preprocessing and a model estimator into a single object that can be fit, cross-validated, and used for prediction in one call.
 
 ```{r nb-spec}
 nb_spec <- naive_Bayes() %>%
@@ -93,16 +83,19 @@ Time for model evaluation. We'll do a standard resampling process to evaluate ou
 
 ```{r}
 set.seed(123)
-incidents_fold <- vfold_cv(incidents_train)
+incidents_folds <- vfold_cv(incidents_train)
 
-incidents_fold
+incidents_folds
+
 ```
+Create a tidymodels workflow to combine the modeling components
+
+> **Python parallel:** A `workflow()` is the tidymodels equivalent of `sklearn.pipeline.Pipeline`. Both bundle preprocessing and a model estimator into a single object that can be fit, cross-validated, and used for prediction in one call.
 
 ```{r nb-workflow}
-nb_wf <- workflow() %>% 
-  add_recipr(recipe) %>% 
+nb_wf <- workflow() |> 
+  add_recipe(recipe) |> 
   add_model(nb_spec)
-  
 ```
 
 To estimate its performance, we fit the model to each of the resampled folds, and then evaluate on the heldout part of each resampled fold.
@@ -112,7 +105,7 @@ To estimate its performance, we fit the model to each of the resampled folds, an
 nb_rs <- tune::fit_resamples(
   nb_wf,
   incidents_folds,
-  control = control_resamples(save_pred = TRUE)
+  control = control_resamples(save_pred=TRUE)
 
 )
 ```
@@ -122,8 +115,8 @@ nb_rs <- tune::fit_resamples(
 Extract the relevant information using collect_metrics() and collect_predictions() and examine the performance metrics.
 
 ```{r performance}
-nb_rs_metrics <- 
-nb_rs_predictions <- 
+nb_rs_metrics <- collect_metrics(nb_rs)
+nb_rs_predictions <- collect_predictions(nb_rs)
 nb_rs_metrics
 ```
 
@@ -162,9 +155,9 @@ tune_spec
 
 ```
 
-```{r tune}
-tune_spec <- logistic_reg(penalty = tune(), mixtire = 1) %>% 
-srt_mode = ("classification") %>% 
+```{r lamba}
+tune_spec <- logistic_reg(penalty=tune(), mixture = 1) |> 
+  set_mode("classification") |> 
   set_engine("glmnet")
 
 tune_spec
@@ -172,25 +165,24 @@ tune_spec
 ```
 
 Here we use grid_regular() to create 30 possible values for the regularization penalty. Then tune_grid() fits a model at each of those values.
-
-```{r lambda}
-lambda_grid <- grid_regular(penalty(), levels = 30)
+```{r}
+lambda_grid <- grid_regular(penalty(), levels = 30) 
 
 lambda_grid
-
 ```
+
 
 
 > **Python parallel:** `grid_regular(penalty(), levels = 30)` + `tune_grid()` is akin to using `GridSearchCV().
 
 ```{r tune}
-tune_wf <- workflow() %>% 
+lasso_wf <- workflow() %>% 
   add_recipe(recipe) %>% 
   add_model(tune_spec)
 
 set.seed(2023)
 tune_rs <- tune_grid(
-  tune_wf,
+  lasso_wf,
   incidents_folds,
   grid = lambda_grid,
   control = control_resamples(save_pred = T)
@@ -222,10 +214,9 @@ chosen_acc <- tune_rs %>%
 Next, let's finalize our workflow with this particular regularization penalty. This is the regularization penalty that our tuning results indicate give us the best model.
 
 ```{r final-model}
-final_lasso <- fit
+final_lasso <- finalize_workflow(lasso_wf, chosen_acc)
 
 final_lasso
-
 ```
 
 The penalty argument value now reflects our tuning result. Now we fit to our training data.
@@ -239,14 +230,20 @@ fitted_lasso
 First let's look at the words associated with an accident being non-deadly.
 
 ```{r words-non-deadly}
-fitted_lasso 
+fitted_lasso |> 
+  extract_fit_parsnip() |> 
+  tidy() |> 
+  arrange(-estimate)
 
 ```
 
 And now the words that are most associated with a deadly incident.
 
 ```{r words-deadly}
-fitted_lasso 
+fitted_lasso|> 
+  extract_fit_parsnip() |> 
+  tidy() |> 
+  arrange(-estimate)
 ```
 
 Finally, let's fit to the test data and see how we did.
